@@ -252,6 +252,15 @@ enum class MacroTilt { RISK_ON, RISK_OFF, NEUTRAL };
 enum class Regime { GROWTH_POSITIVE, GROWTH_NEGATIVE, INFLATION_SHOCK, LIQUIDITY_SHOCK, NEUTRAL };
 enum class DXYTrend { STRONG, WEAK, NEUTRAL };
 enum class DXYFilter { CONFIRMED, SUSPECT, NEUTRAL };
+enum class CurveState { BACKWARDATION, CONTANGO, FLAT };
+
+static const char* curve_str(CurveState c) {
+    switch (c) {
+        case CurveState::BACKWARDATION: return "BACKWARDATION";
+        case CurveState::CONTANGO: return "CONTANGO";
+        default: return "FLAT";
+    }
+}
 
 static const char* tilt_str(MacroTilt t) {
     switch (t) {
@@ -401,6 +410,10 @@ struct StrategyParams {
     int dxy_mom_window = 20;
     double dxy_mom_thresh = 0.03;
 
+    // Layer 4: Term structure
+    double term_structure_thresh = 0.02;  // doc line 606: ±2% annualized roll yield
+    int term_structure_days = 30;         // approx days between front/back months
+
     // Correlation spike
     int corr_window = 20;
     double corr_thresh = 0.70;
@@ -459,28 +472,35 @@ public:
         std::cout << "[DEBUG] 6J first price: " << fut_["6J"].begin()->second.close << "\n";
         std::cout << "[DEBUG] 6J last price:  " << fut_["6J"].rbegin()->second.close << "\n";
 
+        // Load 2nd-month futures for term structure (Layer 4)
+        std::cout << "[INFO] Loading 2nd-month futures for term structure...\n";
+        for (const auto& sym : {"GC", "HG", "SI", "CL", "ZN", "ZB"}) {
+            std::string sym2 = std::string(sym) + "_2nd";
+            fut_2nd_[sym] = load_futures(data_dir_ + "/futures/" + sym2 + ".csv");
+            if (fut_2nd_[sym].empty())
+                std::cerr << "[WARN] No 2nd-month data for " << sym << "\n";
+            else
+                std::cout << "[INFO] Loaded " << fut_2nd_[sym].size() << " bars for " << sym2 << "\n";
+        }
+
         std::cout << "[INFO] Loading macro data...\n";
         dxy_ts_ = load_macro(mac_path("dxy"));
         vix_ts_ = load_macro(mac_path("vix"));
         hy_ts_ = load_macro(mac_path("high_yield_spread"));
         breakeven_ts_ = load_macro(mac_path("breakeven_10y"));
         treasury_ts_ = load_macro(mac_path("treasury_10y"));
-        tips_ts_ = load_macro(mac_path("tips_10y"));        // doc line 682
         spx_ts_ = load_macro(mac_path("spx"));
         fed_bs_ts_ = load_macro(mac_path("fed_balance_sheet"));
         china_cli_ts_ = load_macro(mac_path("china_leading_indicator"));
-        cny_usd_ts_ = load_macro(mac_path("cny_usd"));     // doc line 689
 
         std::cout << "[INFO] DXY records: " << dxy_ts_.size() << "\n";
         std::cout << "[INFO] VIX records: " << vix_ts_.size() << "\n";
         std::cout << "[INFO] HY spread records: " << hy_ts_.size() << "\n";
         std::cout << "[INFO] Breakeven records: " << breakeven_ts_.size() << "\n";
         std::cout << "[INFO] Treasury records: " << treasury_ts_.size() << "\n";
-        std::cout << "[INFO] TIPS records: " << tips_ts_.size() << "\n";
         std::cout << "[INFO] SPX records: " << spx_ts_.size() << "\n";
         std::cout << "[INFO] Fed BS records: " << fed_bs_ts_.size() << "\n";
         std::cout << "[INFO] China CLI records: " << china_cli_ts_.size() << "\n";
-        std::cout << "[INFO] CNY/USD records: " << cny_usd_ts_.size() << "\n";
 
         return !fut_["HG"].empty() && !fut_["GC"].empty();
     }
@@ -532,6 +552,29 @@ public:
         std::vector<double> jy = extract_close("6J");
         std::vector<double> mes = extract_close("MES");
         std::vector<double> mnq = extract_close("MNQ");
+
+        // Extract 2nd-month close prices for term structure (Layer 4)
+        // CRITICAL: HG_2nd.csv is in cents/lb while HG.csv is in dollars/lb
+        //           — divide HG_2nd values by 100.0 inline to match HG front-month units
+        auto extract_2nd_close = [&](const std::string& sym) {
+            std::vector<double> v(n, std::numeric_limits<double>::quiet_NaN());
+            if (fut_2nd_.count(sym) && !fut_2nd_[sym].empty()) {
+                for (int i = 0; i < n; ++i) {
+                    double val = ffill_fut_close(fut_2nd_[sym], dates[i]);
+                    if (!std::isnan(val) && sym == "HG")
+                        val /= 100.0;  // cents/lb -> dollars/lb
+                    v[i] = val;
+                }
+            }
+            return v;
+        };
+
+        std::vector<double> gc_2nd = extract_2nd_close("GC");
+        std::vector<double> hg_2nd = extract_2nd_close("HG");
+        std::vector<double> si_2nd = extract_2nd_close("SI");
+        std::vector<double> cl_2nd = extract_2nd_close("CL");
+        std::vector<double> zn_2nd = extract_2nd_close("ZN");
+        std::vector<double> zb_2nd = extract_2nd_close("ZB");
 
         // ================================================================
         // DATA VALIDATION - Check for unrealistic price moves
@@ -709,6 +752,8 @@ public:
         MacroTilt  last_flip_tilt = MacroTilt::NEUTRAL;
         double     last_equity_debug = equity;
         int        infl_shock_days = 0;
+        Regime     pending_regime = Regime::NEUTRAL;
+        int        pending_regime_count = 0;
 
 
         for (int i = 0; i < n; ++i) {
@@ -852,7 +897,8 @@ public:
             Regime regime = Regime::NEUTRAL;
             if (liquidity < p_.liquidity_thresh) {
                 regime = Regime::LIQUIDITY_SHOCK;
-            } else if (inflation > 0.10 && growth < 0.5) {
+            // Inflation shock threshold: 100bp change in 20-day breakeven (was 10bp — fired too frequently)
+            } else if (inflation > 1.0 && growth < 0.5) {
                 regime = Regime::INFLATION_SHOCK;
             } else if (growth > 0.5) {
                 regime = Regime::GROWTH_POSITIVE;
@@ -866,18 +912,12 @@ public:
                           << " breakeven=" << breakeven[i]
                           << " be_chg_20d=" << (std::isnan(be_chg[i]) ? 0.0 : be_chg[i])
                           << " growth=" << growth
-                          << " inflation_check=" << (inflation > 0.10 && growth < 0.5)
+                          << " inflation_check=" << (inflation > 1.0 && growth < 0.5)
                           << "\n";
             }
 
             // DEBUG: count inflation shock days
             if (regime == Regime::INFLATION_SHOCK) infl_shock_days++;
-
-            // DEBUG: Track regime changes (your existing code, keep it)
-            static Regime last_debug_regime = Regime::NEUTRAL;
-            if (regime != last_debug_regime && dates[i] >= parse_date("2014-11-01")) {
-                last_debug_regime = regime;
-            }
 
             // ============================================================
             // Layer 3: DXY Filter
@@ -977,13 +1017,150 @@ public:
             if (dxy_filter == DXYFilter::SUSPECT)
                 size_mult *= 0.5;
 
-            if (liquidity < p_.liquidity_thresh)
-                size_mult *= 0.25;
+            // Removed: duplicate liquidity check — LIQUIDITY_SHOCK already zeros size_mult at same threshold
 
             if (corr_spike)
                 size_mult *= 0.5;
 
             size_mult *= china_adj;
+
+            // ============================================================
+            // Layer 4: Term Structure Filter (per commodity)
+            // ============================================================
+            // Compute roll yield and classify curve for each commodity
+            // with 2nd-month data: GC, HG, SI, CL, ZN, ZB
+            // roll_yield = (front/back - 1) * (365/days_between)
+            // positive = backwardation, negative = contango
+            std::unordered_map<std::string, CurveState> curve_state;
+            std::unordered_map<std::string, double> ts_mult;  // per-commodity term structure multiplier
+
+            auto calc_curve = [&](const std::string& sym,
+                                  const std::vector<double>& front,
+                                  const std::vector<double>& back) {
+                curve_state[sym] = CurveState::FLAT;
+                ts_mult[sym] = 1.0;
+
+                if (std::isnan(front[i]) || std::isnan(back[i]) || back[i] <= 0.0)
+                    return;
+
+                double roll_yield = (front[i] / back[i] - 1.0) * (365.0 / p_.term_structure_days);
+
+                if (roll_yield > p_.term_structure_thresh)
+                    curve_state[sym] = CurveState::BACKWARDATION;
+                else if (roll_yield < -p_.term_structure_thresh)
+                    curve_state[sym] = CurveState::CONTANGO;
+                else
+                    curve_state[sym] = CurveState::FLAT;
+            };
+
+            calc_curve("GC", gc, gc_2nd);
+            calc_curve("HG", hg, hg_2nd);
+            calc_curve("SI", si, si_2nd);
+            calc_curve("CL", cl, cl_2nd);
+            calc_curve("ZN", zn, zn_2nd);
+
+            // ZB: no front-month ZB in our data; use ZN front vs ZB_2nd for
+            // yield curve spread analysis (steepening/flattening proxy)
+            // ZN_2nd vs ZB_2nd captures the 10Y-30Y curve shape
+            CurveState yield_curve_state = CurveState::FLAT;
+            if (!std::isnan(zn[i]) && !std::isnan(zb_2nd[i]) && zb_2nd[i] > 0.0) {
+                // For bonds: front(ZN) > back(ZB_2nd) implies steepening
+                // (short-end yields higher relative to long-end in price terms)
+                double yc_spread = (zn[i] / zb_2nd[i] - 1.0) * (365.0 / p_.term_structure_days);
+                if (yc_spread > p_.term_structure_thresh)
+                    yield_curve_state = CurveState::BACKWARDATION;  // steepening
+                else if (yc_spread < -p_.term_structure_thresh)
+                    yield_curve_state = CurveState::CONTANGO;       // flattening
+            }
+
+            // ── Apply trade expression matrix from design doc ──
+            // Crude Oil (CL) — doc lines 269-278
+            if (macro_tilt == MacroTilt::RISK_ON) {
+                if (curve_state["CL"] == CurveState::BACKWARDATION)
+                    ts_mult["CL"] = 1.0;   // trend + carry aligned
+                else if (curve_state["CL"] == CurveState::CONTANGO)
+                    ts_mult["CL"] = 0.25;   // "Skip or minimal outright long"
+                else
+                    ts_mult["CL"] = 0.5;    // flat: "Small outright long"
+            } else if (macro_tilt == MacroTilt::RISK_OFF) {
+                if (curve_state["CL"] == CurveState::CONTANGO)
+                    ts_mult["CL"] = 1.0;   // short outright
+                else if (curve_state["CL"] == CurveState::BACKWARDATION)
+                    ts_mult["CL"] = 0.0;   // "Skip — tight markets squeeze shorts"
+                else
+                    ts_mult["CL"] = 0.5;    // flat: "Small outright short"
+            }
+
+            // Copper (HG) — doc lines 280-288
+            if (macro_tilt == MacroTilt::RISK_ON) {
+                if (curve_state["HG"] == CurveState::BACKWARDATION)
+                    ts_mult["HG"] = 1.0;   // "Outright long (trend + carry aligned)"
+                else if (curve_state["HG"] == CurveState::CONTANGO)
+                    ts_mult["HG"] = 0.5;   // "Outright long, reduced size"
+                else
+                    ts_mult["HG"] = 0.75;   // flat: interpolate
+            } else if (macro_tilt == MacroTilt::RISK_OFF) {
+                if (curve_state["HG"] == CurveState::CONTANGO)
+                    ts_mult["HG"] = 1.0;   // "Outright short"
+                else if (curve_state["HG"] == CurveState::BACKWARDATION)
+                    ts_mult["HG"] = 0.0;   // "Skip — don't short tight copper"
+                else
+                    ts_mult["HG"] = 0.5;    // flat: interpolate
+            }
+
+            // Gold (GC) — doc lines 289-295
+            // "Any" term structure — gold typically in contango, less relevant
+            ts_mult["GC"] = 1.0;
+
+            // Silver (SI) — follow copper pattern (industrial + precious hybrid)
+            if (macro_tilt == MacroTilt::RISK_ON) {
+                if (curve_state["SI"] == CurveState::BACKWARDATION)
+                    ts_mult["SI"] = 1.0;
+                else if (curve_state["SI"] == CurveState::CONTANGO)
+                    ts_mult["SI"] = 0.5;
+                else
+                    ts_mult["SI"] = 0.75;
+            } else if (macro_tilt == MacroTilt::RISK_OFF) {
+                // SI is long in risk-off (precious metal bid) — contango less harmful
+                ts_mult["SI"] = 1.0;
+            }
+
+            // Treasuries (ZN, UB) — doc lines 296-304
+            // Use yield curve state for sizing
+            if (macro_tilt == MacroTilt::RISK_ON) {
+                if (yield_curve_state == CurveState::BACKWARDATION)   // steepening
+                    ts_mult["ZN"] = 1.0;   // "Short ZN (belly), or steepener spread"
+                else if (yield_curve_state == CurveState::CONTANGO)   // flattening
+                    ts_mult["ZN"] = 0.5;   // "Short ZN outright, reduced size"
+                else
+                    ts_mult["ZN"] = 0.75;
+            } else if (macro_tilt == MacroTilt::RISK_OFF) {
+                if (yield_curve_state == CurveState::BACKWARDATION)   // steepening
+                    ts_mult["ZN"] = 1.0;   // "Long UB (long end), or steepener"
+                else if (yield_curve_state == CurveState::CONTANGO)   // flattening
+                    ts_mult["ZN"] = 1.0;   // "Long ZN outright"
+                else
+                    ts_mult["ZN"] = 0.75;
+            }
+            // UB follows same yield curve logic as ZN
+            ts_mult["UB"] = ts_mult.count("ZN") ? ts_mult["ZN"] : 1.0;
+
+            // Diagnostics (consistent with existing logging style)
+            if (i % 126 == 0) {
+                std::cout << "[L4-TS] " << date_from_int(dates[i])
+                          << " CL=" << curve_str(curve_state["CL"])
+                          << " HG=" << curve_str(curve_state["HG"])
+                          << " GC=" << curve_str(curve_state["GC"])
+                          << " SI=" << curve_str(curve_state["SI"])
+                          << " ZN=" << curve_str(curve_state["ZN"])
+                          << " YC=" << curve_str(yield_curve_state)
+                          << " ts_mult: CL=" << ts_mult["CL"]
+                          << " HG=" << ts_mult["HG"]
+                          << " SI=" << ts_mult["SI"]
+                          << " ZN=" << ts_mult["ZN"]
+                          << "\n";
+            }
+
         std::unordered_set<std::string> stopped_out_today;
 
             // ============================================================
@@ -1103,8 +1280,8 @@ public:
             // Track previous regime for change detection
             Regime&    prev_regime     = prev_regime_state;
             DXYFilter& prev_dxy_filter = prev_dxy_filter_state;
-            static Regime pending_regime = Regime::NEUTRAL;
-            static int pending_regime_count = 0;
+            // pending_regime and pending_regime_count are now local variables
+            // declared above the loop (not static) to avoid state leaking across run() calls
             if (regime != prev_regime) {
                 if (regime == pending_regime) {
                     pending_regime_count++;
@@ -1276,6 +1453,14 @@ public:
                         new_positions[s] = 0.0;
                 }
 
+                // Apply Layer 4 term structure multipliers (per commodity)
+                for (const auto& sym : {"HG", "GC", "CL", "SI", "ZN", "UB"}) {
+                    if (ts_mult.count(sym) && ts_mult[sym] < 1.0 - 1e-9) {
+                        double old_qty = new_positions[sym];
+                        new_positions[sym] = std::floor(old_qty * ts_mult[sym] + 0.5);
+                    }
+                }
+
                 // ============================================================
                 // POSITION LIMITS - EXACT from doc
                 // ============================================================
@@ -1401,6 +1586,14 @@ public:
                         new_positions["ZN"] = pos_size;
                         new_positions["UB"] = pos_size;
                         new_positions["6J"] = pos_size * (boj_int ? 0.5 : 1.0);
+                    }
+                }
+
+                // Apply Layer 4 term structure multipliers (per commodity)
+                for (const auto& sym : {"HG", "GC", "CL", "SI", "ZN", "UB"}) {
+                    if (ts_mult.count(sym) && ts_mult[sym] < 1.0 - 1e-9) {
+                        double old_qty = new_positions[sym];
+                        new_positions[sym] = std::floor(old_qty * ts_mult[sym] + 0.5);
                     }
                 }
             }
@@ -1654,7 +1847,7 @@ public:
                           << " out of " << n_signals << " total"
                           << " (" << (100.0 * infl_shock_days / n_signals) << "%)\n";
                 std::cout << "  If breakeven is in % units (e.g. 2.5 = 2.5%):\n";
-                std::cout << "    threshold 0.10 = 10bp change over 20d (fires easily)\n";
+                std::cout << "    threshold 1.00 = 100bp change over 20d (spec intent, fixed)\n";
                 std::cout << "    threshold 1.00 = 100bp change over 20d (spec intent)\n";
                 std::cout << "  Expected: ~2-5% of days. If much higher, threshold is wrong.\n";
 
@@ -1670,10 +1863,9 @@ private:
     StrategyParams p_;
 
     std::unordered_map<std::string, FuturesSeries> fut_;
+    std::unordered_map<std::string, FuturesSeries> fut_2nd_;  // 2nd-month futures (Layer 4)
     TimeSeries dxy_ts_, vix_ts_, hy_ts_, breakeven_ts_, treasury_ts_;
-    TimeSeries tips_ts_;       // doc line 682: 10Y TIPS yield
     TimeSeries spx_ts_, fed_bs_ts_, china_cli_ts_;
-    TimeSeries cny_usd_ts_;    // doc line 689: CNY/USD, China FX filter
 };
 
 // ============================================================
