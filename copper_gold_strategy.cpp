@@ -188,45 +188,6 @@ static std::vector<double> rolling_zscore(const std::vector<double>& v, int wind
     return out;
 }
 
-// Rolling mean with expanding window warmup: for bars 0..window-2, uses all
-// available data (expanding window) instead of returning NaN.  Once
-// i >= window-1 the behaviour is identical to rolling_mean().
-static std::vector<double> rolling_mean_expanding(const std::vector<double>& v, int window) {
-    std::vector<double> out(v.size(), std::numeric_limits<double>::quiet_NaN());
-    for (int i = 0; i < (int)v.size(); ++i) {
-        int start = std::max(0, i - window + 1);
-        int count = 0;
-        double sum = 0.0;
-        for (int j = start; j <= i; ++j) {
-            if (!std::isnan(v[j])) { sum += v[j]; ++count; }
-        }
-        if (count > 0) out[i] = sum / count;
-    }
-    return out;
-}
-
-// Rolling std with expanding window warmup: mirrors rolling_mean_expanding.
-// Requires at least 2 valid observations to produce a non-NaN result.
-static std::vector<double> rolling_std_expanding(const std::vector<double>& v, int window) {
-    std::vector<double> out(v.size(), std::numeric_limits<double>::quiet_NaN());
-    for (int i = 0; i < (int)v.size(); ++i) {
-        int start = std::max(0, i - window + 1);
-        int count = 0;
-        double sum = 0.0;
-        for (int j = start; j <= i; ++j) {
-            if (!std::isnan(v[j])) { sum += v[j]; ++count; }
-        }
-        if (count < 2) continue;
-        double mean = sum / count;
-        double var = 0.0;
-        for (int j = start; j <= i; ++j) {
-            if (!std::isnan(v[j])) var += (v[j] - mean) * (v[j] - mean);
-        }
-        out[i] = std::sqrt(var / count);
-    }
-    return out;
-}
-
 // ATR calculation
 static std::vector<double> compute_atr(const std::vector<int>& dates,
                                        const FuturesSeries& fut, int window = 20) {
@@ -436,8 +397,7 @@ struct StrategyParams {
     int zscore_window = 120;
     double zscore_thresh = 0.5;
     double composite_thresh = 0.0;
-    double w1 = 0.25, w2 = 0.25, w3 = 0.25, w4 = 0.25;  // w4 = real rate signal weight
-    double rr_chg_thresh = 0.15;  // 15bp threshold for real rate direction signal
+    double w1 = 0.33, w2 = 0.33, w3 = 0.34;
 
     // Layer 2
     int spx_mom_window = 60;
@@ -707,31 +667,11 @@ public:
             }
         }
 
-        // ================================================================
-        // Detrend Cu/Au ratio: remove secular trend via 504-day (2-year)
-        // rolling z-score.  Uses expanding window for the first 504 bars
-        // so the signal is available from bar 1 onward.
-        // detrended[i] = (ratio[i] - rolling_mean_504[i]) / rolling_std_504[i]
-        // ================================================================
-        static constexpr int DETREND_WINDOW = 504; // ~2 trading years
-        auto ratio_mean_504 = rolling_mean_expanding(ratio, DETREND_WINDOW);
-        auto ratio_std_504  = rolling_std_expanding(ratio, DETREND_WINDOW);
-
-        std::vector<double> detrended(n, std::numeric_limits<double>::quiet_NaN());
-        for (int i = 0; i < n; ++i) {
-            if (!std::isnan(ratio[i]) && !std::isnan(ratio_mean_504[i])
-                && !std::isnan(ratio_std_504[i]) && ratio_std_504[i] > 0.0) {
-                detrended[i] = (ratio[i] - ratio_mean_504[i]) / ratio_std_504[i];
-            }
-        }
-
-        // Signal calculations — use detrended ratio instead of raw ratio
-        // so that ROC, MA crossover, and z-score sub-signals are free of
-        // secular trend bias.
-        auto ratio_sma10 = rolling_mean(detrended, p_.ma_fast);
-        auto ratio_sma50 = rolling_mean(detrended, p_.ma_slow);
-        auto ratio_sma120 = rolling_mean(detrended, p_.zscore_window);
-        auto ratio_std120 = rolling_std(detrended, p_.zscore_window);
+        // Signal calculations on raw Cu/Au ratio
+        auto ratio_sma10 = rolling_mean(ratio, p_.ma_fast);
+        auto ratio_sma50 = rolling_mean(ratio, p_.ma_slow);
+        auto ratio_sma120 = rolling_mean(ratio, p_.zscore_window);
+        auto ratio_std120 = rolling_std(ratio, p_.zscore_window);
 
         // Cu/Au ratio daily log returns and realized vol (for vol sizing filter)
         std::vector<double> ratio_ret(n, std::numeric_limits<double>::quiet_NaN());
@@ -896,13 +836,6 @@ public:
         bool dd_warn_engaged = false;
         bool dd_warn_prev_day = false;  // track transitions for rebalance triggering
 
-        // Regime transition smoothing state (Proposal 3)
-        // When tilt flips between RISK_ON/RISK_OFF/INFLATION (NOT LIQUIDITY_SHOCK),
-        // blend old and new target positions over TRANSITION_PERIOD trading days
-        // to reduce whipsaw turnover.
-        static constexpr int TRANSITION_PERIOD = 10;
-        int transition_day = 0;  // 0 = no transition active; 1..TRANSITION_PERIOD = blending in progress
-        std::unordered_map<std::string, double> old_tilt_targets;  // snapshot of positions at moment of tilt flip
 
         for (int i = 0; i < n; ++i) {
             if (std::isnan(ratio[i])) continue;
@@ -931,12 +864,12 @@ public:
             double roc20 = std::numeric_limits<double>::quiet_NaN();
             double roc60 = std::numeric_limits<double>::quiet_NaN();
 
-            if (i >= p_.roc_10_window && !std::isnan(detrended[i]) && !std::isnan(detrended[i - p_.roc_10_window]) && detrended[i - p_.roc_10_window] != 0.0)
-                roc10 = (detrended[i] / detrended[i - p_.roc_10_window]) - 1.0;
-            if (i >= p_.roc_20_window && !std::isnan(detrended[i]) && !std::isnan(detrended[i - p_.roc_20_window]) && detrended[i - p_.roc_20_window] != 0.0)
-                roc20 = (detrended[i] / detrended[i - p_.roc_20_window]) - 1.0;
-            if (i >= p_.roc_60_window && !std::isnan(detrended[i]) && !std::isnan(detrended[i - p_.roc_60_window]) && detrended[i - p_.roc_60_window] != 0.0)
-                roc60 = (detrended[i] / detrended[i - p_.roc_60_window]) - 1.0;
+            if (i >= p_.roc_10_window && !std::isnan(ratio[i]) && !std::isnan(ratio[i - p_.roc_10_window]) && ratio[i - p_.roc_10_window] != 0.0)
+                roc10 = (ratio[i] / ratio[i - p_.roc_10_window]) - 1.0;
+            if (i >= p_.roc_20_window && !std::isnan(ratio[i]) && !std::isnan(ratio[i - p_.roc_20_window]) && ratio[i - p_.roc_20_window] != 0.0)
+                roc20 = (ratio[i] / ratio[i - p_.roc_20_window]) - 1.0;
+            if (i >= p_.roc_60_window && !std::isnan(ratio[i]) && !std::isnan(ratio[i - p_.roc_60_window]) && ratio[i - p_.roc_60_window] != 0.0)
+                roc60 = (ratio[i] / ratio[i - p_.roc_60_window]) - 1.0;
 
             double signal_ma = 0.0;
             if (!std::isnan(ratio_sma10[i]) && !std::isnan(ratio_sma50[i]))
@@ -945,23 +878,15 @@ public:
             double zscore = std::numeric_limits<double>::quiet_NaN();
             double signal_z = 0.0;
             if (!std::isnan(ratio_sma120[i]) && !std::isnan(ratio_std120[i]) && ratio_std120[i] > 0.0) {
-                zscore = (detrended[i] - ratio_sma120[i]) / ratio_std120[i];
+                zscore = (ratio[i] - ratio_sma120[i]) / ratio_std120[i];
                 if (zscore > p_.zscore_thresh) signal_z = 1.0;
                 else if (zscore < -p_.zscore_thresh) signal_z = -1.0;
-            }
-
-            // Real rate direction signal: falling real rates = risk-on (+1),
-            // rising real rates = risk-off (-1). Thresholded at +/-15bp 20d change.
-            double signal_rr = 0.0;
-            if (!std::isnan(rr_chg[i])) {
-                if (rr_chg[i] < -p_.rr_chg_thresh)      signal_rr = 1.0;   // falling real rates = easing = risk-on
-                else if (rr_chg[i] > p_.rr_chg_thresh)   signal_rr = -1.0;  // rising real rates = tightening = risk-off
             }
 
             double composite = std::numeric_limits<double>::quiet_NaN();
             if (!std::isnan(roc20) && !std::isnan(zscore)) {
                 double sign_roc20 = (roc20 > 0.0) ? 1.0 : -1.0;
-                composite = p_.w1 * sign_roc20 + p_.w2 * signal_ma + p_.w3 * signal_z + p_.w4 * signal_rr;
+                composite = p_.w1 * sign_roc20 + p_.w2 * signal_ma + p_.w3 * signal_z;
             }
 
             MacroTilt raw_tilt = MacroTilt::NEUTRAL;
@@ -1096,24 +1021,6 @@ public:
             if (regime == Regime::INFLATION_SHOCK) infl_shock_days++;
 
             // ============================================================
-            // Real Rate Regime Confidence Modifier (P2-A)
-            // When real rate direction CONFIRMS Cu/Au signal, full conviction.
-            // When they DISAGREE, reduce sizing by 25%.
-            // signal_rr > 0 means falling real rates = risk-on
-            // signal_rr < 0 means rising real rates = risk-off
-            // ============================================================
-            double regime_confidence = 1.0;
-            if (signal_rr != 0.0 && !std::isnan(composite)) {
-                // Check agreement: composite > 0 = risk-on, signal_rr > 0 = risk-on
-                bool composite_risk_on = (composite > 0.0);
-                bool rr_risk_on = (signal_rr > 0.0);
-                if (composite_risk_on != rr_risk_on) {
-                    regime_confidence = 0.75;  // disagreement: reduce sizing by 25%
-                }
-                // Agreement: regime_confidence stays 1.0 (full conviction)
-            }
-
-            // ============================================================
             // Layer 3: DXY Filter
             // ============================================================
             DXYTrend dxy_trend = DXYTrend::NEUTRAL;
@@ -1217,9 +1124,6 @@ public:
                 size_mult *= 0.5;
 
             size_mult *= china_adj;
-
-            // Real rate regime confidence: discount sizing when Cu/Au and real rates disagree
-            size_mult *= regime_confidence;
 
             // Cu/Au realized vol filter: scale down when short-term vol expands vs long-term
             if (!std::isnan(ratio_rvol_63[i]) && !std::isnan(ratio_rvol_252[i]) && ratio_rvol_252[i] > 0.0) {
@@ -1627,39 +1531,6 @@ public:
             // last_flip_tilt tracks the confirmed macro_tilt from previous day exactly
             bool tilt_changed = tilt_just_changed;
 
-            // ============================================================
-            // Regime Transition Smoothing — counter management
-            // Runs every bar (not just rebalance days) so the 10-day
-            // calendar ticks accurately.
-            // ============================================================
-            if (regime == Regime::LIQUIDITY_SHOCK) {
-                // Emergency override: cancel any in-progress transition
-                if (transition_day > 0) {
-                    std::cout << "[TRANSITION] " << date_from_int(dates[i])
-                              << " CANCELLED by LIQUIDITY_SHOCK (was day "
-                              << transition_day << ")\n";
-                }
-                transition_day = 0;
-                old_tilt_targets.clear();
-            } else if (tilt_changed) {
-                // New tilt flip: snapshot current holdings and start transition
-                old_tilt_targets = positions;
-                transition_day = 1;
-                std::cout << "[TRANSITION] " << date_from_int(dates[i])
-                          << " STARTED tilt flip -> "
-                          << tilt_str(macro_tilt) << " (day 1/"
-                          << TRANSITION_PERIOD << ")\n";
-            } else if (transition_day > 0) {
-                transition_day++;
-                if (transition_day > TRANSITION_PERIOD) {
-                    std::cout << "[TRANSITION] " << date_from_int(dates[i])
-                              << " COMPLETE (day " << TRANSITION_PERIOD
-                              << " reached)\n";
-                    transition_day = 0;
-                    old_tilt_targets.clear();
-                }
-            }
-
             bool do_rebalance = is_friday || regime_changed || filter_triggered ||
                     stop_triggered || tilt_changed;
 
@@ -1762,54 +1633,54 @@ public:
                         si_adj = gc_dollar_atr / si_dollar_atr;
                 }
 
-                double boj_factor = boj_int ? 0.5 : 1.0;
+                // boj_factor removed: 6J dropped from trading universe (pure cost drag)
 
                 // TRADE EXPRESSIONS - EXACT from doc
                 if (macro_tilt == MacroTilt::RISK_ON) {
                     if (regime == Regime::INFLATION_SHOCK) {
-                        new_positions["MES"] = 0.0;
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"]  = contracts_for("HG", 1.0) * china_adj;
+                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"]  = contracts_for("CL", 1.0);
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI", 1.0, si_adj);
                         new_positions["GC"]  = skip_gold_short ? 0.0 : contracts_for("GC", -1.0);
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
-                        new_positions["6J"]  = contracts_for("6J", -1.0) * boj_factor;
+                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
                     } else {
-                        new_positions["MES"] = contracts_for("MES", 1.0);
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         new_positions["MNQ"] = contracts_for("MNQ", 1.0);
-                        new_positions["HG"]  = contracts_for("HG",  1.0) * china_adj;
+                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"]  = contracts_for("CL",  1.0);
                         new_positions["GC"]  = skip_gold_short ? 0.0 : contracts_for("GC", -1.0);
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",  1.0, si_adj);
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
-                        new_positions["6J"]  = contracts_for("6J", -1.0) * boj_factor;
+                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
                     }
                 } else if (macro_tilt == MacroTilt::RISK_OFF) {
                     if (regime == Regime::INFLATION_SHOCK) {
                         new_positions["GC"]  = contracts_for("GC",  1.0);
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
-                        new_positions["MES"] = contracts_for("MES", -0.5);
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"]  = 0.0;
+                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"]  = 0.0;
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",  1.0, si_adj);
-                        new_positions["6J"]  = 0.0;
+                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
                     } else {
-                        new_positions["MES"] = contracts_for("MES", -1.0);
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"]  = contracts_for("HG",  -1.0);
+                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"]  = contracts_for("CL",  -1.0);
                         new_positions["GC"]  = contracts_for("GC",   1.0);
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",   1.0, si_adj);
                         new_positions["ZN"]  = contracts_for("ZN",   1.0);
                         new_positions["UB"]  = contracts_for("UB",   1.0);
-                        new_positions["6J"]  = contracts_for("6J",   1.0) * boj_factor;
+                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
                     }
                 } else {
                     for (const char* s : {"HG","GC","CL","SI","MES","MNQ","ZN","UB","6J"})
@@ -1848,6 +1719,13 @@ public:
                     auto lit = SINGLE_NOTIONAL_LIMIT.find(sym);
                     if (lit == SINGLE_NOTIONAL_LIMIT.end()) continue;
                     double max_q = std::floor(std::max(0.0, equity * lit->second) / ContractSpec::get(sym).notional);
+                    // FIX: Guarantee at least 1 contract when the strategy has a
+                    // non-zero target.  Without this floor, instruments whose
+                    // per-contract notional exceeds the single-instrument cap
+                    // (e.g. GC @ $420K > 15% of $1M = $150K) get clamped to 0
+                    // and can never trade.
+                    if (max_q < 1.0 && std::abs(qty) > 1e-9)
+                        max_q = 1.0;
                     if (std::abs(qty) > max_q)
                         qty = std::copysign(max_q, qty);
                 }
@@ -1865,8 +1743,13 @@ public:
                         double scale = max_eq / eq_not;
                         for (const auto& s : {"MES", "MNQ"}) {
                             auto it = new_positions.find(s);
-                            if (it != new_positions.end())
-                                it->second = std::floor(it->second * scale + 0.5);
+                            if (it != new_positions.end()) {
+                                double old_val = it->second;
+                                double scaled = std::floor(std::abs(old_val) * scale + 0.5);
+                                if (scaled < 1.0 && std::abs(old_val) > 1e-9)
+                                    scaled = 1.0;
+                                it->second = std::copysign(scaled, old_val);
+                            }
                         }
                     }
                 }
@@ -1884,8 +1767,19 @@ public:
                         double scale = max_com / com_not;
                         for (const auto& s : {"HG", "GC", "CL", "SI"}) {
                             auto it = new_positions.find(s);
-                            if (it != new_positions.end())
-                                it->second = std::floor(it->second * scale + 0.5);
+                            if (it != new_positions.end()) {
+                                double old_val = it->second;
+                                // FIX: Use copysign rounding to avoid
+                                // floor(negative * scale + 0.5) bias that
+                                // collapses small negative positions to 0.
+                                // Guarantee at least 1 contract (in original
+                                // direction) for any position that was non-zero
+                                // before scaling.
+                                double scaled = std::floor(std::abs(old_val) * scale + 0.5);
+                                if (scaled < 1.0 && std::abs(old_val) > 1e-9)
+                                    scaled = 1.0;
+                                it->second = std::copysign(scaled, old_val);
+                            }
                         }
                     }
                 }
@@ -1897,8 +1791,13 @@ public:
                 margin_util = (equity > 0.0) ? total_margin / equity : 0.0;
                 if (margin_util > p_.max_margin_util && margin_util > 0.0) {
                     double scale = p_.max_margin_util / margin_util;
-                    for (auto& [sym, qty] : new_positions)
-                        qty = std::floor(qty * scale + 0.5);
+                    for (auto& [sym, qty] : new_positions) {
+                        double old_val = qty;
+                        double scaled = std::floor(std::abs(old_val) * scale + 0.5);
+                        if (scaled < 1.0 && std::abs(old_val) > 1e-9)
+                            scaled = 1.0;
+                        qty = std::copysign(scaled, old_val);
+                    }
                     margin_util = p_.max_margin_util;
                 }
 
@@ -1908,25 +1807,25 @@ public:
 
                 if (macro_tilt == MacroTilt::RISK_ON) {
                     if (regime == Regime::INFLATION_SHOCK) {
-                        new_positions["HG"] = pos_size;
+                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"] = pos_size;
                         new_positions["SI"] = pos_size;
                         new_positions["GC"] = skip_gold_short ? 0.0 : -pos_size;
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
-                        new_positions["6J"] = -pos_size * (boj_int ? 0.5 : 1.0);
-                        new_positions["MES"] = 0.0;
+                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         new_positions["MNQ"] = 0.0;
                     } else {
-                        new_positions["MES"] = pos_size;
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         new_positions["MNQ"] = pos_size;
-                        new_positions["HG"] = pos_size;
+                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"] = pos_size;
                         new_positions["SI"] = pos_size;
                         new_positions["GC"] = skip_gold_short ? 0.0 : -pos_size;
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
-                        new_positions["6J"] = -pos_size * (boj_int ? 0.5 : 1.0);
+                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
                     }
                 } else if (macro_tilt == MacroTilt::RISK_OFF) {
                     if (regime == Regime::INFLATION_SHOCK) {
@@ -1934,23 +1833,23 @@ public:
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
                         new_positions["SI"] = pos_size;
-                        new_positions["MES"] = -pos_size * 0.5;
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"] = 0.0;
+                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"] = 0.0;
-                        new_positions["6J"] = 0.0;
+                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
                     } else {
-                        new_positions["MES"] = -pos_size;
+                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
                         // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"] = -pos_size;
+                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
                         new_positions["CL"] = -pos_size;
                         new_positions["GC"] = pos_size;
                         new_positions["SI"] = pos_size;
                         new_positions["ZN"] = pos_size;
                         new_positions["UB"] = pos_size;
-                        new_positions["6J"] = pos_size * (boj_int ? 0.5 : 1.0);
+                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
                     }
                 }
 
@@ -1967,37 +1866,6 @@ public:
                 new_positions[sym] = 0.0;
             }
 
-            // ============================================================
-            // Regime Transition Smoothing — position blending
-            // When a tilt flip is in progress (transition_day in [1, TRANSITION_PERIOD]),
-            // blend old-tilt positions with new-tilt targets using linear ramp.
-            // Day k: target = (1 - k/TRANSITION_PERIOD) * old + (k/TRANSITION_PERIOD) * new
-            // LIQUIDITY_SHOCK bypasses this entirely (transition_day already zeroed above).
-            // ============================================================
-            if (transition_day > 0 && transition_day <= TRANSITION_PERIOD
-                && regime != Regime::LIQUIDITY_SHOCK) {
-                double blend_new = static_cast<double>(transition_day) / TRANSITION_PERIOD;
-                double blend_old = 1.0 - blend_new;
-
-                // Collect all instrument symbols from both old and new targets
-                std::unordered_set<std::string> all_syms;
-                for (const auto& [sym, qty] : new_positions) all_syms.insert(sym);
-                for (const auto& [sym, qty] : old_tilt_targets) all_syms.insert(sym);
-
-                for (const auto& sym : all_syms) {
-                    double new_qty = new_positions.count(sym) ? new_positions.at(sym) : 0.0;
-                    double old_qty = old_tilt_targets.count(sym) ? old_tilt_targets.at(sym) : 0.0;
-                    double blended = blend_old * old_qty + blend_new * new_qty;
-                    new_positions[sym] = std::floor(blended + 0.5);
-                }
-
-                std::cout << "[TRANSITION] " << date_from_int(dates[i])
-                          << " BLEND day " << transition_day << "/"
-                          << TRANSITION_PERIOD
-                          << " weight_new=" << std::fixed << std::setprecision(1)
-                          << (blend_new * 100.0) << "%\n";
-            }
-
             // REBALANCE BANDS: suppress noise trades (same-direction resizing below threshold)
             for (auto& [sym, new_qty] : new_positions) {
                 double old_qty = positions.count(sym) ? positions.at(sym) : 0.0;
@@ -2011,9 +1879,9 @@ public:
 
                 if (!direction_flip && !entry_or_exit) {
                     // Suppress same-direction resizing below threshold:
-                    // Must exceed BOTH absolute band (2 contracts) AND relative band (30%)
+                    // Must exceed BOTH absolute band (3 contracts) AND relative band (40%)
                     double relative_change = delta / current_abs;
-                    if (delta < 2.0 || relative_change < 0.30) {
+                    if (delta < 3.0 || relative_change < 0.40) {
                         new_qty = old_qty;  // keep current position
                     }
                 }
@@ -2059,11 +1927,11 @@ public:
             // Print debug every 6 months (126 trading days)
 
 
-                // Show non-zero positions (limit to 5 to keep output manageable)
+                // Show non-zero positions (limit to 9 to cover all instruments)
                 std::string pos_str;
                 int pos_count = 0;
                 for (const auto& [sym, qty] : positions) {
-                    if (qty != 0.0 && pos_count < 5) {
+                    if (qty != 0.0 && pos_count < 9) {
                         char buf[50];
                         snprintf(buf, sizeof(buf), "%s:%.0f ", sym.c_str(), qty);
                         pos_str += buf;
