@@ -1,7 +1,6 @@
 // copper_gold_strategy.cpp
 //
-// Copper-Gold Ratio Economic Regime Strategy v2.0
-// 100% consistent with copper_gold_strategy_v2.md
+// Copper-Gold Ratio Economic Regime Strategy v5.0
 //
 // No synthetic data. No lookahead bias. All signals use only data[0..i].
 
@@ -254,14 +253,6 @@ enum class DXYTrend { STRONG, WEAK, NEUTRAL };
 enum class DXYFilter { CONFIRMED, SUSPECT, NEUTRAL };
 enum class CurveState { BACKWARDATION, CONTANGO, FLAT };
 
-static const char* curve_str(CurveState c) {
-    switch (c) {
-        case CurveState::BACKWARDATION: return "BACKWARDATION";
-        case CurveState::CONTANGO: return "CONTANGO";
-        default: return "FLAT";
-    }
-}
-
 static const char* tilt_str(MacroTilt t) {
     switch (t) {
         case MacroTilt::RISK_ON: return "RISK_ON";
@@ -406,15 +397,9 @@ struct StrategyParams {
     int real_rate_chg_window = 20;
     int real_rate_z_window = 120;
     double liquidity_thresh = -1.5;
-    // Inflation shock: 20-day change in 10Y breakeven rate (percentage points).
-    // Breakeven data is in pct-point units (e.g., 2.5 = 2.5%). A 20-day change
-    // of 0.15 = 15bp. Calibration (2003-2026, combined with growth < 0.5 filter):
-    //   0.10 (10bp) -> 5.3%   0.15 (15bp) -> 3.3%   0.20 (20bp) -> 2.2%
-    //   0.30 (30bp) -> 1.2%   1.00 (100bp) -> 0.0% (never fires — max in data is 97bp)
-    // 0.15 chosen: captures genuine inflation shocks (2008, 2009, 2016, 2020, 2022)
-    // while filtering noise. ~90th percentile of raw 20d breakeven changes.
-    // Previous values: 0.10 (Task 001, fired 22% without growth filter),
-    //                  1.0  (Task 002 overcorrection, fired 0% — literally unreachable).
+    // Inflation shock: 20d change in 10Y breakeven rate (pct-points).
+    // 0.15 = 15bp, fires ~3.3% of days (with growth<0.5 filter).
+    // Captures genuine shocks (2008, 2009, 2016, 2020, 2022).
     double inflation_thresh = 0.15;
 
     // Layer 3
@@ -486,14 +471,6 @@ public:
             else
                 std::cout << "[INFO] Loaded " << fut_[sym].size() << " bars for " << sym << "\n";
         }
-
-        // Verify units
-        std::cout << "[DEBUG] GC first price: " << fut_["GC"].begin()->second.close << "\n";
-        std::cout << "[DEBUG] GC last price:  " << fut_["GC"].rbegin()->second.close << "\n";
-        std::cout << "[DEBUG] HG first price: " << fut_["HG"].begin()->second.close << "\n";
-        std::cout << "[DEBUG] HG last price:  " << fut_["HG"].rbegin()->second.close << "\n";
-        std::cout << "[DEBUG] 6J first price: " << fut_["6J"].begin()->second.close << "\n";
-        std::cout << "[DEBUG] 6J last price:  " << fut_["6J"].rbegin()->second.close << "\n";
 
         // Load 2nd-month futures for term structure (Layer 4)
         std::cout << "[INFO] Loading 2nd-month futures for term structure...\n";
@@ -622,7 +599,6 @@ public:
 
                 double pct_change = std::abs(curr - prev) / prev;
                 if (pct_change > 0.5) {  // 50% move in one day
-                    // Keep existing [ERROR] log for backwards compatibility
                     std::cout << "[ERROR] Unrealistic " << sym << " price move: "
                               << date_from_int(dates[i-1]) << " " << prev
                               << " -> " << date_from_int(dates[i]) << " " << curr
@@ -642,7 +618,6 @@ public:
                 }
             }
         }
-
 
         std::vector<double> dxy = extract_macro(dxy_ts_);
         std::vector<double> vix = extract_macro(vix_ts_);
@@ -814,12 +789,10 @@ public:
         };
 
         // State variables that persist across iterations (weekly rebalance, regime tracking)
-        // State variables that persist across iterations (weekly rebalance, regime tracking)
         Regime     prev_regime_state     = Regime::NEUTRAL;
         DXYFilter  prev_dxy_filter_state = DXYFilter::NEUTRAL;
         std::deque<int> flip_dates_deque;
         MacroTilt  last_flip_tilt = MacroTilt::NEUTRAL;
-        double     last_equity_debug = equity;
         int        infl_shock_days = 0;
         Regime     pending_regime = Regime::NEUTRAL;
         int        pending_regime_count = 0;
@@ -979,16 +952,6 @@ public:
             double fbs_component = fbs_raw * 10.0;  // scale: 0.3 YoY growth -> +3.0
             double liquidity = (vix_component + hy_component + fbs_component) / 3.0;
 
-            // DEBUG: Print liquidity values around Nov 2014
-            if (dates[i] >= parse_date("2014-11-01") && dates[i] <= parse_date("2014-12-31")) {
-                std::cout << date_from_int(dates[i])
-                          << " liquidity: " << liquidity
-                          << " vix_comp: " << vix_component
-                          << " hy_comp: " << hy_component
-                          << " fbs_comp: " << fbs_component
-                          << " thresh: " << p_.liquidity_thresh << "\n";
-            }
-
             double rr_val = std::isnan(real_rate[i]) ? 0.0 : real_rate[i];
             double rr_chg_val = std::isnan(rr_chg[i]) ? 0.0 : rr_chg[i];
             double rr_z_val = std::isnan(rr_zscore[i]) ? 0.0 : rr_zscore[i];
@@ -1004,20 +967,6 @@ public:
                 regime = Regime::GROWTH_NEGATIVE;
             }
 
-            // Periodic inflation regime diagnostic (every ~6 months, matching other diagnostics)
-            if (i % 126 == 0) {
-                bool fires = (inflation > p_.inflation_thresh && growth < 0.5);
-                std::cout << "[INFLATION-CHECK] " << date_from_int(dates[i])
-                          << " breakeven=" << std::fixed << std::setprecision(2) << breakeven[i]
-                          << " be_chg_20d=" << std::showpos << std::setprecision(3)
-                          << (std::isnan(be_chg[i]) ? 0.0 : be_chg[i]) << std::noshowpos
-                          << " threshold=" << std::setprecision(2) << p_.inflation_thresh
-                          << " growth=" << std::setprecision(2) << growth
-                          << " fires=" << (fires ? "TRUE" : "false")
-                          << "\n";
-            }
-
-            // DEBUG: count inflation shock days
             if (regime == Regime::INFLATION_SHOCK) infl_shock_days++;
 
             // ============================================================
@@ -1036,8 +985,7 @@ public:
                 dxy_mom = (dxy[i] / dxy[i - p_.dxy_mom_window]) - 1.0;
 
             DXYFilter dxy_filter = DXYFilter::NEUTRAL;
-            // Lines 657-664 - CURRENT CODE:
-            // EXACT from outline lines 160-169 (DXY Filter Rules table):
+            // DXY Filter Rules (outline lines 160-169):
             if (!std::isnan(dxy_mom)) {
                 if (dxy_mom > p_.dxy_mom_thresh) {  // DXY momentum > +3%
                     if (macro_tilt == MacroTilt::RISK_ON) {
@@ -1117,8 +1065,6 @@ public:
 
             if (dxy_filter == DXYFilter::SUSPECT)
                 size_mult *= 0.5;
-
-            // Removed: duplicate liquidity check — LIQUIDITY_SHOCK already zeros size_mult at same threshold
 
             // HY spread confirmation filter: halve size when Cu/Au tilt disagrees with credit direction
             if (i >= 20 && !std::isnan(hy[i]) && !std::isnan(hy[i - 20])) {
@@ -1273,23 +1219,7 @@ public:
             // UB follows same yield curve logic as ZN
             ts_mult["UB"] = ts_mult.count("ZN") ? ts_mult["ZN"] : 1.0;
 
-            // Diagnostics (consistent with existing logging style)
-            if (i % 126 == 0) {
-                std::cout << "[L4-TS] " << date_from_int(dates[i])
-                          << " CL=" << curve_str(curve_state["CL"])
-                          << " HG=" << curve_str(curve_state["HG"])
-                          << " GC=" << curve_str(curve_state["GC"])
-                          << " SI=" << curve_str(curve_state["SI"])
-                          << " ZN=" << curve_str(curve_state["ZN"])
-                          << " YC=" << curve_str(yield_curve_state)
-                          << " ts_mult: CL=" << ts_mult["CL"]
-                          << " HG=" << ts_mult["HG"]
-                          << " SI=" << ts_mult["SI"]
-                          << " ZN=" << ts_mult["ZN"]
-                          << "\n";
-            }
-
-        std::unordered_set<std::string> stopped_out_today;
+            std::unordered_set<std::string> stopped_out_today;
 
             // ============================================================
             // P&L Calculation
@@ -1350,23 +1280,8 @@ public:
                     }
                 }
 
-
-
                 equity += daily_pnl;
-
-                if (daily_pnl > 10000 || daily_pnl < -10000) {
-                    std::cout << "        Post-equity: $" << equity << "\n";
-                }
-
                 if (equity > peak_equity) peak_equity = equity;
-
-
-                // Add sanity check
-                if (equity > last_equity_debug * 1.5 || equity < last_equity_debug * 0.5) {
-                    std::cout << "[WARN] Unusual equity change: "
-                              << last_equity_debug << " -> " << equity << "\n";
-                }
-                last_equity_debug = equity;
             }
 
             // Drawdown circuit breaker
@@ -1489,15 +1404,6 @@ public:
                 dd_warn_engaged = false;
             }
 
-            if ((dd_stop || dd_warn) && !dd_stopped) {
-                std::cout << "[DD] " << date_from_int(dates[i])
-                          << " equity=" << equity
-                          << " peak=" << peak_equity
-                          << " dd=" << drawdown
-                          << " stop=" << dd_stop
-                          << " warn=" << dd_warn << "\n";
-            }
-
             // ============================================================
             // EQUITY SAFETY GUARDS (before any sizing math)
             // ============================================================
@@ -1535,8 +1441,6 @@ public:
             // Track previous regime for change detection
             Regime&    prev_regime     = prev_regime_state;
             DXYFilter& prev_dxy_filter = prev_dxy_filter_state;
-            // pending_regime and pending_regime_count are now local variables
-            // declared above the loop (not static) to avoid state leaking across run() calls
             if (regime != prev_regime) {
                 if (regime == pending_regime) {
                     pending_regime_count++;
@@ -1556,20 +1460,6 @@ public:
 
             bool do_rebalance = is_friday || regime_changed || filter_triggered ||
                     stop_triggered || tilt_changed;
-
-            if (do_rebalance) {
-                std::cout << "[REB] " << date_from_int(dates[i])
-                          << " fri=" << is_friday
-                          << " regime=" << regime_changed
-                          << " filter=" << filter_triggered
-                          << " stop=" << stop_triggered
-                          << " tilt=" << tilt_changed
-                          << " flat=" << all_positions_zero(positions)
-                          << " size_mult=" << size_mult        // ADD THIS
-                          << " dd=" << drawdown               // ADD THIS
-                          << "\n";
-
-            }
 
             // FORCE REBALANCE if we have no positions but size_mult says we should trade
             if (!do_rebalance && size_mult > 0.0 && all_positions_zero(positions)) {
@@ -1656,54 +1546,53 @@ public:
                         si_adj = gc_dollar_atr / si_dollar_atr;
                 }
 
-                // boj_factor removed: 6J dropped from trading universe (pure cost drag)
-
-                // TRADE EXPRESSIONS - EXACT from doc
+                // TRADE EXPRESSIONS
+                // V5: MES, HG, 6J dropped (cost drag > alpha). MNQ short
+                // removed in RISK_OFF (persistent loser vs tech bull).
+                // HG price data still used for Cu/Au ratio signal.
                 if (macro_tilt == MacroTilt::RISK_ON) {
                     if (regime == Regime::INFLATION_SHOCK) {
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"]  = 0.0;
                         new_positions["CL"]  = contracts_for("CL", 1.0);
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI", 1.0, si_adj);
                         new_positions["GC"]  = skip_gold_short ? 0.0 : contracts_for("GC", -1.0);
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
-                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["6J"]  = 0.0;
                     } else {
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = contracts_for("MNQ", 1.0);
-                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"]  = 0.0;
                         new_positions["CL"]  = contracts_for("CL",  1.0);
                         new_positions["GC"]  = skip_gold_short ? 0.0 : contracts_for("GC", -1.0);
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",  1.0, si_adj);
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
-                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["6J"]  = 0.0;
                     }
                 } else if (macro_tilt == MacroTilt::RISK_OFF) {
                     if (regime == Regime::INFLATION_SHOCK) {
                         new_positions["GC"]  = contracts_for("GC",  1.0);
                         new_positions["ZN"]  = contracts_for("ZN", -1.0);
                         new_positions["UB"]  = contracts_for("UB", -1.0);
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
-                        // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"]  = 0.0;
                         new_positions["CL"]  = 0.0;
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",  1.0, si_adj);
-                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["6J"]  = 0.0;
                     } else {
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
-                        // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"]  = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"]  = 0.0;
                         new_positions["CL"]  = contracts_for("CL",  -1.0);
                         new_positions["GC"]  = contracts_for("GC",   1.0);
                         new_positions["SI"]  = std::isnan(si_adj) ? 0.0 : contracts_for("SI",   1.0, si_adj);
                         new_positions["ZN"]  = contracts_for("ZN",   1.0);
                         new_positions["UB"]  = contracts_for("UB",   1.0);
-                        new_positions["6J"]  = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["6J"]  = 0.0;
                     }
                 } else {
                     for (const char* s : {"HG","GC","CL","SI","MES","MNQ","ZN","UB","6J"})
@@ -1722,31 +1611,12 @@ public:
                 // POSITION LIMITS - EXACT from doc
                 // ============================================================
                 // Per-instrument notional cap
-
-
-                // Right after new_positions are calculated, before position limits
-                std::cout << "[SIZING] " << date_from_int(dates[i])
-                          << " equity=" << equity
-                          << " size_mult=" << size_mult
-                          << " GC_raw=" << (equity * p_.leverage_target * 0.35 / 200000.0 * size_mult)
-                          << " GC_final=" << new_positions["GC"]
-                          << " com_notional_before_cap="
-                          << (std::abs(new_positions["HG"]) * 110000.0 +
-                              std::abs(new_positions["GC"]) * 200000.0 +
-                              std::abs(new_positions["CL"]) * 75000.0 +
-                              std::abs(new_positions["SI"]) * 150000.0)
-                          << " com_cap=" << (equity * MAX_TOTAL_COMMODITY_NOTIONAL)
-                          << "\n";
-
                 for (auto& [sym, qty] : new_positions) {
                     auto lit = SINGLE_NOTIONAL_LIMIT.find(sym);
                     if (lit == SINGLE_NOTIONAL_LIMIT.end()) continue;
                     double max_q = std::floor(std::max(0.0, equity * lit->second) / ContractSpec::get(sym).notional);
-                    // FIX: Guarantee at least 1 contract when the strategy has a
-                    // non-zero target.  Without this floor, instruments whose
-                    // per-contract notional exceeds the single-instrument cap
-                    // (e.g. GC @ $420K > 15% of $1M = $150K) get clamped to 0
-                    // and can never trade.
+                    // Guarantee at least 1 contract when target is non-zero, so
+                    // high-notional instruments (e.g. GC) aren't clamped to 0.
                     if (max_q < 1.0 && std::abs(qty) > 1e-9)
                         max_q = 1.0;
                     if (std::abs(qty) > max_q)
@@ -1792,12 +1662,8 @@ public:
                             auto it = new_positions.find(s);
                             if (it != new_positions.end()) {
                                 double old_val = it->second;
-                                // FIX: Use copysign rounding to avoid
-                                // floor(negative * scale + 0.5) bias that
-                                // collapses small negative positions to 0.
-                                // Guarantee at least 1 contract (in original
-                                // direction) for any position that was non-zero
-                                // before scaling.
+                                // Round via abs+copysign to avoid negative rounding bias.
+                                // Guarantee at least 1 contract in original direction.
                                 double scaled = std::floor(std::abs(old_val) * scale + 0.5);
                                 if (scaled < 1.0 && std::abs(old_val) > 1e-9)
                                     scaled = 1.0;
@@ -1829,26 +1695,27 @@ public:
                 double pos_size = p_.fixed_position_size * size_mult;
 
                 if (macro_tilt == MacroTilt::RISK_ON) {
+                    // (same V5 drops as full-sizing mode above)
                     if (regime == Regime::INFLATION_SHOCK) {
-                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"] = 0.0;
                         new_positions["CL"] = pos_size;
                         new_positions["SI"] = pos_size;
                         new_positions["GC"] = skip_gold_short ? 0.0 : -pos_size;
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
-                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
+                        new_positions["6J"] = 0.0;
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = 0.0;
                     } else {
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = pos_size;
-                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"] = 0.0;
                         new_positions["CL"] = pos_size;
                         new_positions["SI"] = pos_size;
                         new_positions["GC"] = skip_gold_short ? 0.0 : -pos_size;
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
-                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["6J"] = 0.0;
                     }
                 } else if (macro_tilt == MacroTilt::RISK_OFF) {
                     if (regime == Regime::INFLATION_SHOCK) {
@@ -1856,23 +1723,21 @@ public:
                         new_positions["ZN"] = -pos_size;
                         new_positions["UB"] = -pos_size;
                         new_positions["SI"] = pos_size;
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
-                        // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"] = 0.0;
                         new_positions["CL"] = 0.0;
-                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["6J"] = 0.0;
                     } else {
-                        new_positions["MES"] = 0.0;  // Dropped: MES — pure cost drag, net P&L ~zero after commissions
-                        // MNQ short removed: persistent loser in RISK_OFF since 2019 launch (short Nasdaq during tech bull market)
+                        new_positions["MES"] = 0.0;
                         new_positions["MNQ"] = 0.0;
-                        new_positions["HG"] = 0.0;  // Dropped: HG — pure cost drag, net P&L negative after commissions (Cu/Au ratio signal still computed from HG price data)
+                        new_positions["HG"] = 0.0;
                         new_positions["CL"] = -pos_size;
                         new_positions["GC"] = pos_size;
                         new_positions["SI"] = pos_size;
                         new_positions["ZN"] = pos_size;
                         new_positions["UB"] = pos_size;
-                        new_positions["6J"] = 0.0;  // Dropped: 6J — pure cost drag, net P&L negative after commissions
+                        new_positions["6J"] = 0.0;
                     }
                 }
 
@@ -1949,34 +1814,6 @@ public:
                 }
             }
             positions = new_positions;
-
-            // Print debug every 6 months (126 trading days)
-
-
-                // Show non-zero positions (limit to 9 to cover all instruments)
-                std::string pos_str;
-                int pos_count = 0;
-                for (const auto& [sym, qty] : positions) {
-                    if (qty != 0.0 && pos_count < 9) {
-                        char buf[50];
-                        snprintf(buf, sizeof(buf), "%s:%.0f ", sym.c_str(), qty);
-                        pos_str += buf;
-                        pos_count++;
-                    }
-                }
-                if (!pos_str.empty())
-                    std::cout << "        Positions: " << pos_str << "\n";
-
-
-            // Print warning if position sizes get too large
-            if (!p_.use_fixed_positions) {
-                for (const auto& [sym, qty] : positions) {
-                    if (std::abs(qty) > 100) {
-                        //std::cout << "[WARN] Large position: " << sym << " = " << qty
-                                  //<< " at " << date_from_int(dates[i]) << "\n";
-                    }
-                }
-            }
 
             // ============================================================
             // Save signal
@@ -2226,9 +2063,9 @@ private:
 // Main
 // ============================================================
 int main(int argc, char* argv[]) {
-    std::cout << "[INFO] Copper-Gold Strategy v2.0\n";
+    std::cout << "[INFO] Copper-Gold Strategy v5.0\n";
 
-    std::string data_dir = "./data/raw";
+    std::string data_dir = "./data/cleaned";
     double initial_capital = 1000000.0;
     bool use_fixed = false;
 
