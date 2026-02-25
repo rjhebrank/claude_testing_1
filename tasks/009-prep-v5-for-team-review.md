@@ -76,9 +76,25 @@ Prepare the V5 strategy for push to the team repo (`Copper_Gold_IP_Repo`). Clean
   - 2-3 sentence bottom line
 - **Formatting**: Use clean markdown tables, minimal prose, max visual clarity. This will be screenshotted and sent to teammates.
 
+### Agent 4: Generate Equity Curve Chart
+- Parse `results/backtest_output_v5.txt` — extract daily equity values (look for equity/P&L log lines)
+- Use Python (`.venv/` with pandas + matplotlib — install matplotlib if needed: `uv pip install matplotlib`)
+- **Generate `results/v5_equity_curve.png`** — a clean, professional equity curve chart:
+  - X-axis: Date (2010-2025)
+  - Y-axis: Portfolio equity ($)
+  - Title: "Copper-Gold Macro Strategy — V5 Equity Curve"
+  - Include a subtitle or annotation with headline numbers: "Sharpe 0.50 | CAGR 4.34% | Max DD 14.1%"
+  - Draw a horizontal line at $1,000,000 (starting capital) for reference
+  - Shade drawdown periods (or at minimum mark the max drawdown period)
+  - Clean styling: white background, gridlines, readable font sizes
+  - Figure size should be presentation-quality (e.g., 14x7 inches, 150 DPI)
+- If daily equity isn't directly in the backtest output, reconstruct it from the trade log / P&L entries
+- This chart will be screenshotted and shared with teammates
+
 ## Instructions
-- Deploy all 3 agents in parallel — they're independent
+- Deploy all 4 agents in parallel — they're independent
 - Agent 1 must verify compilation and backtest match after cleanup
 - Agent 2 should read the original `v2.md` first for tone/style calibration
 - Agent 3 should be concise — this is a screenshot, not a report
+- Agent 4: install matplotlib if needed, generate a clean PNG
 - Do NOT commit — Terminal 1 handles all git operations
