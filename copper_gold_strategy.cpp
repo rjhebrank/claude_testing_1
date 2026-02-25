@@ -1120,6 +1120,18 @@ public:
 
             // Removed: duplicate liquidity check — LIQUIDITY_SHOCK already zeros size_mult at same threshold
 
+            // HY spread confirmation filter: halve size when Cu/Au tilt disagrees with credit direction
+            if (i >= 20 && !std::isnan(hy[i]) && !std::isnan(hy[i - 20])) {
+                double hy_chg_20d = hy[i] - hy[i - 20];
+                bool hy_disagree = false;
+                if (macro_tilt == MacroTilt::RISK_ON && hy_chg_20d > 0.0)
+                    hy_disagree = true;   // credit widening contradicts risk-on
+                else if (macro_tilt == MacroTilt::RISK_OFF && hy_chg_20d < 0.0)
+                    hy_disagree = true;   // credit tightening contradicts risk-off
+                if (hy_disagree)
+                    size_mult *= 0.50;
+            }
+
             if (corr_spike)
                 size_mult *= 0.5;
 
@@ -1398,6 +1410,17 @@ public:
                             size_mult = 0.5;
                         if (dxy_filter == DXYFilter::SUSPECT)
                             size_mult *= 0.5;
+                        // HY spread confirmation filter (mirror of primary cascade)
+                        if (i >= 20 && !std::isnan(hy[i]) && !std::isnan(hy[i - 20])) {
+                            double hy_chg_20d = hy[i] - hy[i - 20];
+                            bool hy_disagree = false;
+                            if (macro_tilt == MacroTilt::RISK_ON && hy_chg_20d > 0.0)
+                                hy_disagree = true;
+                            else if (macro_tilt == MacroTilt::RISK_OFF && hy_chg_20d < 0.0)
+                                hy_disagree = true;
+                            if (hy_disagree)
+                                size_mult *= 0.50;
+                        }
                         if (corr_spike)
                             size_mult *= 0.5;
                         size_mult *= china_adj;
@@ -1879,9 +1902,12 @@ public:
 
                 if (!direction_flip && !entry_or_exit) {
                     // Suppress same-direction resizing below threshold:
-                    // Must exceed BOTH absolute band (3 contracts) AND relative band (40%)
+                    // Must exceed BOTH absolute band AND relative band
+                    // UB/ZN use wider bands (4 contracts / 50%) to reduce bond turnover
+                    double abs_band = (sym == "UB" || sym == "ZN") ? 4.0 : 3.0;
+                    double rel_band = (sym == "UB" || sym == "ZN") ? 0.50 : 0.40;
                     double relative_change = delta / current_abs;
-                    if (delta < 3.0 || relative_change < 0.40) {
+                    if (delta < abs_band || relative_change < rel_band) {
                         new_qty = old_qty;  // keep current position
                     }
                 }
