@@ -405,6 +405,16 @@ struct StrategyParams {
     int real_rate_chg_window = 20;
     int real_rate_z_window = 120;
     double liquidity_thresh = -1.5;
+    // Inflation shock: 20-day change in 10Y breakeven rate (percentage points).
+    // Breakeven data is in pct-point units (e.g., 2.5 = 2.5%). A 20-day change
+    // of 0.15 = 15bp. Calibration (2003-2026, combined with growth < 0.5 filter):
+    //   0.10 (10bp) -> 5.3%   0.15 (15bp) -> 3.3%   0.20 (20bp) -> 2.2%
+    //   0.30 (30bp) -> 1.2%   1.00 (100bp) -> 0.0% (never fires — max in data is 97bp)
+    // 0.15 chosen: captures genuine inflation shocks (2008, 2009, 2016, 2020, 2022)
+    // while filtering noise. ~90th percentile of raw 20d breakeven changes.
+    // Previous values: 0.10 (Task 001, fired 22% without growth filter),
+    //                  1.0  (Task 002 overcorrection, fired 0% — literally unreachable).
+    double inflation_thresh = 0.15;
 
     // Layer 3
     int dxy_mom_window = 20;
@@ -578,29 +588,45 @@ public:
 
         // ================================================================
         // DATA VALIDATION - Check for unrealistic price moves
+        // Forward-fill bad prices and mark bars for skip
         // ================================================================
-        for (int i = 1; i < n; ++i) {
-            double hg_change = std::abs(hg[i] - hg[i-1]) / hg[i-1];
-            double gc_change = std::abs(gc[i] - gc[i-1]) / gc[i-1];
-            double cl_change = std::abs(cl[i] - cl[i-1]) / cl[i-1];
+        std::unordered_set<int> skip_bars;  // bar indices with rejected data
 
-            if (hg_change > 0.5) {  // 50% move in one day
-                std::cout << "[ERROR] Unrealistic HG price move: "
-                          << date_from_int(dates[i-1]) << " " << hg[i-1]
-                          << " -> " << date_from_int(dates[i]) << " " << hg[i]
-                          << " (" << (hg_change*100) << "%)\n";
-            }
-            if (gc_change > 0.5) {
-                std::cout << "[ERROR] Unrealistic GC price move: "
-                          << date_from_int(dates[i-1]) << " " << gc[i-1]
-                          << " -> " << date_from_int(dates[i]) << " " << gc[i]
-                          << " (" << (gc_change*100) << "%)\n";
-            }
-            if (cl_change > 0.5) {
-                std::cout << "[ERROR] Unrealistic CL price move: "
-                          << date_from_int(dates[i-1]) << " " << cl[i-1]
-                          << " -> " << date_from_int(dates[i]) << " " << cl[i]
-                          << " (" << (cl_change*100) << "%)\n";
+        struct PriceCheck {
+            std::string sym;
+            std::vector<double>* prices;
+        };
+        std::vector<PriceCheck> price_checks = {
+            {"HG", &hg}, {"GC", &gc}, {"CL", &cl}, {"SI", &si},
+            {"ZN", &zn}, {"UB", &ub}, {"6J", &jy}, {"MES", &mes}, {"MNQ", &mnq}
+        };
+
+        for (int i = 1; i < n; ++i) {
+            for (auto& [sym, prices] : price_checks) {
+                double prev = (*prices)[i-1];
+                double curr = (*prices)[i];
+                if (std::isnan(prev) || std::isnan(curr) || prev == 0.0) continue;
+
+                double pct_change = std::abs(curr - prev) / prev;
+                if (pct_change > 0.5) {  // 50% move in one day
+                    // Keep existing [ERROR] log for backwards compatibility
+                    std::cout << "[ERROR] Unrealistic " << sym << " price move: "
+                              << date_from_int(dates[i-1]) << " " << prev
+                              << " -> " << date_from_int(dates[i]) << " " << curr
+                              << " (" << (pct_change*100) << "%)\n";
+
+                    // Forward-fill previous day's price for the affected instrument
+                    std::cout << "[DATA-REJECT] " << date_from_int(dates[i])
+                              << " " << sym << " price " << prev << "->" << curr
+                              << " (" << std::fixed << std::setprecision(1)
+                              << (pct_change*100) << "% move)"
+                              << std::defaultfloat
+                              << " — bar skipped, forward-filling\n";
+                    (*prices)[i] = prev;
+
+                    // Mark this bar for skip — no signal/position/equity updates
+                    skip_bars.insert(i);
+                }
             }
         }
 
@@ -755,9 +781,34 @@ public:
         Regime     pending_regime = Regime::NEUTRAL;
         int        pending_regime_count = 0;
 
+        // Drawdown circuit breaker state (persists across iterations)
+        bool       dd_stopped = false;       // true while circuit breaker is active
+        int        dd_cooldown_remaining = 0; // trading days remaining in cooldown
+        int        dd_stable_bars = 0;        // consecutive bars with no further equity decline
+        double     dd_stable_equity = 0.0;    // equity at start of stabilization check
+        static constexpr int DD_COOLDOWN_DAYS = 20;   // min bars before re-entry possible
+        static constexpr int DD_STABLE_BARS   = 10;   // consecutive non-declining bars required
 
         for (int i = 0; i < n; ++i) {
             if (std::isnan(ratio[i])) continue;
+
+            // ============================================================
+            // DATA-REJECT: skip all trading logic for bars with bad data
+            // Positions, equity, and peak_equity carry forward unchanged
+            // ============================================================
+            if (skip_bars.count(i)) {
+                DailySignal sig;
+                sig.date = date_from_int(dates[i]);
+                sig.cu_gold_ratio = ratio[i];
+                sig.macro_tilt = prev_tilt;
+                sig.regime = prev_regime_state;
+                sig.dxy_filter = prev_dxy_filter_state;
+                sig.target_contracts = positions;
+                sig.portfolio_equity = equity;
+                sig.spx_price = std::isnan(spx[i]) ? 0.0 : spx[i];
+                signals.push_back(sig);
+                continue;
+            }
 
             // ============================================================
             // Layer 1: Signal Generation
@@ -897,8 +948,7 @@ public:
             Regime regime = Regime::NEUTRAL;
             if (liquidity < p_.liquidity_thresh) {
                 regime = Regime::LIQUIDITY_SHOCK;
-            // Inflation shock threshold: 100bp change in 20-day breakeven (was 10bp — fired too frequently)
-            } else if (inflation > 1.0 && growth < 0.5) {
+            } else if (inflation > p_.inflation_thresh && growth < 0.5) {
                 regime = Regime::INFLATION_SHOCK;
             } else if (growth > 0.5) {
                 regime = Regime::GROWTH_POSITIVE;
@@ -906,13 +956,16 @@ public:
                 regime = Regime::GROWTH_NEGATIVE;
             }
 
-            // DEBUG: breakeven units check
-            if (i % 252 == 0) {
-                std::cout << "[BE_CHECK] " << date_from_int(dates[i])
-                          << " breakeven=" << breakeven[i]
-                          << " be_chg_20d=" << (std::isnan(be_chg[i]) ? 0.0 : be_chg[i])
-                          << " growth=" << growth
-                          << " inflation_check=" << (inflation > 1.0 && growth < 0.5)
+            // Periodic inflation regime diagnostic (every ~6 months, matching other diagnostics)
+            if (i % 126 == 0) {
+                bool fires = (inflation > p_.inflation_thresh && growth < 0.5);
+                std::cout << "[INFLATION-CHECK] " << date_from_int(dates[i])
+                          << " breakeven=" << std::fixed << std::setprecision(2) << breakeven[i]
+                          << " be_chg_20d=" << std::showpos << std::setprecision(3)
+                          << (std::isnan(be_chg[i]) ? 0.0 : be_chg[i]) << std::noshowpos
+                          << " threshold=" << std::setprecision(2) << p_.inflation_thresh
+                          << " growth=" << std::setprecision(2) << growth
+                          << " fires=" << (fires ? "TRUE" : "false")
                           << "\n";
             }
 
@@ -1238,26 +1291,106 @@ public:
                 last_equity_debug = equity;
             }
 
-            // Drawdown stops
+            // Drawdown circuit breaker
             bool dd_warn = false, dd_stop = false;
             double drawdown = (peak_equity > 0.0) ? (peak_equity - equity) / peak_equity : 0.0;
-            if (drawdown > p_.drawdown_stop) {
-                size_mult = 0.0;
+
+            // --- Circuit breaker recovery check (runs while stopped) ---
+            if (dd_stopped) {
                 dd_stop = true;
+                size_mult = 0.0;
+
+                if (dd_cooldown_remaining > 0) {
+                    --dd_cooldown_remaining;
+                } else {
+                    // Cooldown expired -- check for equity stabilization
+                    if (equity >= dd_stable_equity) {
+                        ++dd_stable_bars;
+                    } else {
+                        // Equity declined again -- reset stabilization counter
+                        dd_stable_bars = 0;
+                        dd_stable_equity = equity;
+                    }
+                    if (dd_stable_bars >= DD_STABLE_BARS) {
+                        // Resume trading -- reset high-water mark to current equity
+                        dd_stopped = false;
+                        dd_stop = false;
+                        peak_equity = equity;
+                        dd_stable_bars = 0;
+                        std::cout << "[DRAWDOWN-RESUME] " << date_from_int(dates[i])
+                                  << " Cooldown complete. Equity: $" << std::fixed
+                                  << std::setprecision(2) << equity << "\n";
+                        // Recalculate size_mult from scratch (it was zeroed above)
+                        size_mult = 1.0;
+                        if (regime == Regime::LIQUIDITY_SHOCK)
+                            size_mult = 0.0;
+                        else if (macro_tilt == MacroTilt::RISK_ON && regime == Regime::GROWTH_NEGATIVE)
+                            size_mult = 0.5;
+                        else if (regime == Regime::NEUTRAL)
+                            size_mult = 0.5;
+                        else if (regime == Regime::INFLATION_SHOCK)
+                            size_mult = 0.5;
+                        if (dxy_filter == DXYFilter::SUSPECT)
+                            size_mult *= 0.5;
+                        if (corr_spike)
+                            size_mult *= 0.5;
+                        size_mult *= china_adj;
+                    }
+                }
+            } else if (drawdown > p_.drawdown_stop) {
+                // --- Fresh drawdown stop trigger ---
+                dd_stop = true;
+                size_mult = 0.0;
+                dd_stopped = true;
+                dd_cooldown_remaining = DD_COOLDOWN_DAYS;
+                dd_stable_bars = 0;
+                dd_stable_equity = equity;
+
+                // IMMEDIATELY flatten all positions -- zero out actual holdings
+                for (auto& [sym, qty] : positions) {
+                    if (qty != 0.0) {
+                        // Deduct transaction costs for liquidation
+                        double cost = ContractSpec::total_cost_rt(sym) * std::abs(qty);
+                        equity -= cost;
+                        qty = 0.0;
+                        entry_prices[sym] = std::numeric_limits<double>::quiet_NaN();
+                    }
+                }
+
+                std::cout << "[DRAWDOWN-STOP] " << date_from_int(dates[i])
+                          << " Liquidating all positions."
+                          << " Equity: $" << std::fixed << std::setprecision(2) << equity
+                          << ", Drawdown: " << std::setprecision(2) << drawdown * 100.0 << "%"
+                          << ", Peak: $" << std::setprecision(2) << peak_equity << "\n";
             } else if (drawdown > p_.drawdown_warn) {
                 size_mult *= 0.5;
                 dd_warn = true;
             }
-            if (dd_stop && all_positions_zero(positions)) {
-                peak_equity = equity;
-            }
-            if (dd_stop || dd_warn) {
+
+            if ((dd_stop || dd_warn) && !dd_stopped) {
                 std::cout << "[DD] " << date_from_int(dates[i])
                           << " equity=" << equity
                           << " peak=" << peak_equity
                           << " dd=" << drawdown
                           << " stop=" << dd_stop
                           << " warn=" << dd_warn << "\n";
+            }
+
+            // ============================================================
+            // EQUITY SAFETY GUARDS (before any sizing math)
+            // ============================================================
+            if (equity <= 0.0) {
+                size_mult = 0.0;
+                std::cout << "[EQUITY-ZERO] " << date_from_int(dates[i])
+                          << " Equity depleted ($" << std::fixed << std::setprecision(2)
+                          << equity << "). All positions zeroed.\n";
+            } else if (equity < p_.initial_capital * 0.10) {
+                double ruin_guard = 0.50;
+                size_mult *= ruin_guard;
+                std::cout << "[EQUITY-LOW] " << date_from_int(dates[i])
+                          << " Equity $" << std::fixed << std::setprecision(2) << equity
+                          << " < 10% of initial ($" << std::setprecision(2)
+                          << p_.initial_capital * 0.10 << "). Size reduced 50%.\n";
             }
 
             // ============================================================
@@ -1386,7 +1519,7 @@ public:
 
                     const auto cls = asset_class(sym);
                     double w = ASSET_WEIGHTS.count(cls) ? ASSET_WEIGHTS.at(cls) : 0.1;
-                    double notional_alloc = equity * p_.leverage_target * w;
+                    double notional_alloc = std::max(0.0, equity * p_.leverage_target * w);
                     const auto spec = ContractSpec::get(sym);
                     double raw = (notional_alloc / spec.notional) * size_mult * vol_adj;
                     return std::floor(raw * direction + 0.5);
@@ -1484,7 +1617,7 @@ public:
                 for (auto& [sym, qty] : new_positions) {
                     auto lit = SINGLE_NOTIONAL_LIMIT.find(sym);
                     if (lit == SINGLE_NOTIONAL_LIMIT.end()) continue;
-                    double max_q = std::floor(equity * lit->second / ContractSpec::get(sym).notional);
+                    double max_q = std::floor(std::max(0.0, equity * lit->second) / ContractSpec::get(sym).notional);
                     if (std::abs(qty) > max_q)
                         qty = std::copysign(max_q, qty);
                 }
@@ -1497,7 +1630,7 @@ public:
                         if (it != new_positions.end())
                             eq_not += std::abs(it->second) * ContractSpec::get(s).notional;
                     }
-                    double max_eq = equity * MAX_TOTAL_EQUITY_NOTIONAL;
+                    double max_eq = std::max(0.0, equity * MAX_TOTAL_EQUITY_NOTIONAL);
                     if (eq_not > max_eq && eq_not > 0.0) {
                         double scale = max_eq / eq_not;
                         for (const auto& s : {"MES", "MNQ"}) {
@@ -1516,7 +1649,7 @@ public:
                         if (it != new_positions.end())
                             com_not += std::abs(it->second) * ContractSpec::get(s).notional;
                     }
-                    double max_com = equity * MAX_TOTAL_COMMODITY_NOTIONAL;
+                    double max_com = std::max(0.0, equity * MAX_TOTAL_COMMODITY_NOTIONAL);
                     if (com_not > max_com && com_not > 0.0) {
                         double scale = max_com / com_not;
                         for (const auto& s : {"HG", "GC", "CL", "SI"}) {
@@ -1845,11 +1978,10 @@ public:
                 std::cout << "\n── 8. INFLATION SHOCK TRIGGER COUNT ──\n";
                 std::cout << "  INFLATION_SHOCK days: " << infl_shock_days
                           << " out of " << n_signals << " total"
-                          << " (" << (100.0 * infl_shock_days / n_signals) << "%)\n";
-                std::cout << "  If breakeven is in % units (e.g. 2.5 = 2.5%):\n";
-                std::cout << "    threshold 1.00 = 100bp change over 20d (spec intent, fixed)\n";
-                std::cout << "    threshold 1.00 = 100bp change over 20d (spec intent)\n";
-                std::cout << "  Expected: ~2-5% of days. If much higher, threshold is wrong.\n";
+                          << " (" << std::setprecision(1) << (100.0 * infl_shock_days / n_signals) << "%)\n";
+                std::cout << "  Threshold: " << p_.inflation_thresh
+                          << " (" << static_cast<int>(p_.inflation_thresh * 100) << "bp 20-day breakeven change)\n";
+                std::cout << "  Expected: ~3-5% of days (with growth<0.5 filter).\n";
 
                 std::cout << "\n══════════════════════════════════════════════════════════════\n";
             }

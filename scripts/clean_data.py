@@ -44,6 +44,13 @@ log = logging.getLogger(__name__)
 # whether to interpolate, drop, or raise.
 MAX_FFILL_LIMIT = 5
 
+# Single-bar percentage move threshold for spike detection (futures only).
+# Any OHLC column that moves more than this fraction in one bar is treated
+# as a data error.  The spiked row AND the next row (the reversion bar)
+# are both forward-filled from the last known good values.
+# 0.50 = 50 %  -- no legitimate commodity future moves 50 % in a single day.
+SPIKE_THRESHOLD = 0.50
+
 # Columns that we expect in a well-formed futures CSV.
 # The script will still work if extra columns exist; it only needs 'date'.
 FUTURES_PRICE_COLS = ["open", "high", "low", "close"]
@@ -194,14 +201,92 @@ def clean_futures_file(filepath: Path) -> Optional[dict]:
     log.info("  Forward-filled %d missing value(s).", missing_filled)
 
     # ------------------------------------------------------------------
-    # 3. Flag suspicious rows (do NOT delete)
+    # 3. Spike detection — flag AND forward-fill single-bar blowups
+    # ------------------------------------------------------------------
+    # Walk through rows comparing each price against the last known good
+    # value.  If any OHLC column moved more than SPIKE_THRESHOLD, the row
+    # is marked as bad and its price+volume values are set to NaN.  Good
+    # rows update the reference.  One final forward-fill replaces all bad
+    # rows at once.  This handles multi-bar unit shifts (e.g. a week of
+    # 100x prices) in a single pass without iteration.
+
+    spike_rows: set[int] = set()
+
+    # Determine which columns to overwrite: all price cols + volume.
+    cols_to_fill = [
+        c for c in FUTURES_PRICE_COLS + [FUTURES_VOLUME_COL] if c in df.columns
+    ]
+    price_cols_present = [c for c in FUTURES_PRICE_COLS if c in df.columns]
+
+    # Single-pass spike detection: walk through rows in order, comparing
+    # each row's prices against the last known good values.  If any price
+    # column moved more than SPIKE_THRESHOLD vs. the last good value, the
+    # row is bad.  Bad rows are set to NaN and skipped; good rows update
+    # the reference.  After marking, one forward-fill fixes everything.
+    if price_cols_present:
+        # Find the first row with all non-NaN prices as the initial
+        # reference ("last known good").
+        last_good: dict[str, float] = {}
+        start_idx = 0
+        for i in df.index:
+            vals = {c: df.at[i, c] for c in price_cols_present}
+            if all(pd.notna(v) for v in vals.values()):
+                last_good = vals
+                start_idx = i + 1
+                break
+
+        if last_good:
+            for i in df.index[df.index >= start_idx]:
+                is_spike = False
+                for col in price_cols_present:
+                    cur = df.at[i, col]
+                    if pd.isna(cur) or last_good[col] == 0:
+                        continue
+                    pct = abs(cur - last_good[col]) / abs(last_good[col])
+                    if pct > SPIKE_THRESHOLD:
+                        is_spike = True
+                        break
+
+                if is_spike:
+                    spike_rows.add(i)
+                    df.loc[i, cols_to_fill] = pd.NA
+                else:
+                    # Update last known good reference.
+                    for col in price_cols_present:
+                        val = df.at[i, col]
+                        if pd.notna(val):
+                            last_good[col] = val
+
+            # One forward-fill replaces all spiked rows at once.
+            if spike_rows:
+                df[cols_to_fill] = df[cols_to_fill].ffill()
+
+    spike_count = len(spike_rows)
+    spike_indices_sorted: list[int] = sorted(spike_rows)
+
+    if spike_count > 0:
+        log.info(
+            "  Detected %d spike row(s) (threshold=%.0f%%). "
+            "Forward-filled from last good values.",
+            spike_count,
+            SPIKE_THRESHOLD * 100,
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Flag suspicious rows (do NOT delete)
     # ------------------------------------------------------------------
     # Initialise flag column with empty strings; we will concatenate reasons.
     df[SUSPICIOUS_FLAG_COL] = ""
 
     suspicious_count = 0
 
-    # 3a. Zero price in any OHLC column
+    # 4a. Mark spike/reversion rows that were forward-filled in step 3.
+    if spike_count > 0:
+        for idx in spike_indices_sorted:
+            df.loc[idx, SUSPICIOUS_FLAG_COL] = "spike_ffilled;"
+        log.info("  Flagged %d row(s) as spike_ffilled.", spike_count)
+
+    # 4b. Zero price in any OHLC column
     for col in FUTURES_PRICE_COLS:
         if col in df.columns:
             zero_mask = df[col] == 0
@@ -213,7 +298,7 @@ def clean_futures_file(filepath: Path) -> Optional[dict]:
                 )
                 log.info("  Flagged %d row(s) with zero %s.", count, col)
 
-    # 3b. Negative price in any OHLC column
+    # 4c. Negative price in any OHLC column
     for col in FUTURES_PRICE_COLS:
         if col in df.columns:
             neg_mask = df[col] < 0
@@ -225,7 +310,7 @@ def clean_futures_file(filepath: Path) -> Optional[dict]:
                 )
                 log.info("  Flagged %d row(s) with negative %s.", count, col)
 
-    # 3c. Zero volume on a weekday
+    # 4d. Zero volume on a weekday
     if FUTURES_VOLUME_COL in df.columns:
         zero_vol_mask = df[FUTURES_VOLUME_COL] == 0
         count = zero_vol_mask.sum()
@@ -253,6 +338,7 @@ def clean_futures_file(filepath: Path) -> Optional[dict]:
         "cleaned_rows": cleaned_rows,
         "rows_removed": original_rows - cleaned_rows,
         "missing_values_filled": missing_filled,
+        "spike_rows_ffilled": spike_count,
         "suspicious_rows_flagged": int(suspicious_count),
         "date_range_start": date_start,
         "date_range_end": date_end,
@@ -324,6 +410,7 @@ def clean_macro_file(filepath: Path) -> Optional[dict]:
         "cleaned_rows": cleaned_rows,
         "rows_removed": original_rows - cleaned_rows,
         "missing_values_filled": missing_filled,
+        "spike_rows_ffilled": 0,  # No spike detection for macro.
         "suspicious_rows_flagged": 0,  # No suspicious-value flagging for macro.
         "date_range_start": date_start,
         "date_range_end": date_end,
@@ -424,6 +511,7 @@ def run_pipeline(input_dir: Path, output_dir: Path) -> None:
             "cleaned_rows",
             "rows_removed",
             "missing_values_filled",
+            "spike_rows_ffilled",
             "suspicious_rows_flagged",
             "date_range_start",
             "date_range_end",
@@ -439,6 +527,7 @@ def run_pipeline(input_dir: Path, output_dir: Path) -> None:
         total_cleaned = report_df["cleaned_rows"].sum()
         total_removed = report_df["rows_removed"].sum()
         total_filled = report_df["missing_values_filled"].sum()
+        total_spikes = report_df["spike_rows_ffilled"].sum()
         total_flagged = report_df["suspicious_rows_flagged"].sum()
 
         log.info("=" * 60)
@@ -448,6 +537,7 @@ def run_pipeline(input_dir: Path, output_dir: Path) -> None:
         log.info("  Total cleaned rows : %d", total_cleaned)
         log.info("  Total rows removed : %d", total_removed)
         log.info("  Total values filled: %d", total_filled)
+        log.info("  Total spike rows   : %d", total_spikes)
         log.info("  Total rows flagged : %d", total_flagged)
         log.info("=" * 60)
     else:
